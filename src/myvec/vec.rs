@@ -11,8 +11,18 @@ use std::alloc::{Allocator, Global};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
-use std::fmt::Alignment;
-use crate::myvec::alignment::MyAlignment;
+use std::num::{NonZero, NonZeroUsize};
+
+// To try to follow with the std library implementation we will define a top level Alloc Enum which can
+// help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
+// we have zeroed memory in which we need to allocate
+
+#[derive(Clone, Copy, Debug)]
+enum AllocInit {
+	Uninitialized,
+	Zeroed
+}
+
 // For ZSTs there is zero allocation but a defined alignment
 // A vec of Vec<()>::new() could be size = 0 but alignment = 1
 // Allocators work in bytes so they give only non-zero-sized chunks of memory if we were to pass in a
@@ -112,7 +122,7 @@ struct RawInnerVec<A: Allocator = Global> {
 	// We have ownership of this raw byte buffer. It's untyped and safe for all T and can be
 	// cast later. Is always NonNull
 	ptr: NonNull<u8>, // The allocator allocated based on raw bytes and not on typed memory hence u8
-	cap: usize, // Usize for now but will use custom Cap type to enforce 0..isize::MAX checks
+	cap: Cap, // Use custom Cap type to enforce 0..isize::MAX checks
 	alloc: A,
 }
 
@@ -136,13 +146,27 @@ impl<A: Allocator> RawInnerVec<A> {
 	#[inline]
 	// A constructor usually does not allocate, so here we want to initialize and empty buffer with cap = 0
 	// and a dangling pointer. We also need to store the alloc
-	const fn new_in(alloc: A, align: MyAlignment) -> Self {
-		// We need to define a NonNull pointer without provenance, meaning the pointer is cannot be used
+	const fn new_in(alloc: A, align: usize) -> Self {
+		// We need to define a NonNull pointer without provenance, meaning the pointer cannot be used
 		// for memory access as we have not yet allocated memory
 		// NonNull::dangling() provides an abstracted function for this but the alignment is always known when we
 		// have the T type.
 		// For this layer, we pass down the alignment from the type so we must align ourselves
-		let ptr = NonNull::without_provenance(_);
+
+		// Std does this by using its internal Alignment implementation [https://doc.rust-lang.org/src/core/ptr/alignment.rs.html#13]
+		// Looking through the docs it seems that for a RawInnerVec only a usize is needed which is derived from
+		// using Alignment -> Alignment::of::<T>() which gives a NonZero<usize> to pass to Layout
+
+		// align_of_val also gives this [https://doc.rust-lang.org/src/core/mem/mod.rs.html#509-512]
+		// So to avoid using an internal structure and to avoid implementing my own Alignment struct
+		// I will pass in a usize derived from align_of_val() which I can wrap in a NonZero
+
+		// SAFETY: RawVec uses align_of_val which checks for correct alignment and non-zero so we are safe to
+		// use new_unchecked here
+		let nsu = unsafe { NonZeroUsize::new_unchecked(align) };
+		let ptr = NonNull::without_provenance(nsu);
+		Self { ptr, cap: ZERO_CAP, alloc }
+
 	}
 
 }
