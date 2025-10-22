@@ -7,7 +7,7 @@
 // Level 2: RawVec which holds a RawInner, a Cap for storing the capacity of a vec and a marker for the drop checker
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
-use std::alloc::{Allocator, Global};
+use std::alloc::{Allocator, Global, GlobalAlloc};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
@@ -118,6 +118,7 @@ unsafe fn new_cap<T>(cap: usize) -> Cap {
 /// The standard library uses this separation for operations which require only the layout
 ///
 /// We leave the type to the layer above in RawVec
+#[derive(Debug)]
 struct RawInnerVec<A: Allocator = Global> {
 	// We have ownership of this raw byte buffer. It's untyped and safe for all T and can be
 	// cast later. Is always NonNull
@@ -129,6 +130,7 @@ struct RawInnerVec<A: Allocator = Global> {
 // InnerVec will cast *mut u8 bytes to *mut T when using it
 
 // Level 2
+#[derive(Debug)]
 struct InnerVec<T, A: Allocator = Global> {
 	inner: RawInnerVec<A>,
 	_marker: PhantomData<T>, // To signal to the drop checker that there is a type here to check
@@ -171,9 +173,21 @@ impl<A: Allocator> RawInnerVec<A> {
 
 }
 
+//NOTE: std library uses two implement blocks for an InnerVec. The first being a Global allocator
+// almost like a default, using the default global allocator and its functions
+// The second being generic over A an Allocator which can be passed in.
 
-
-
+// IMPL BLOCK for Default Global Allocator InnerVec
+// For a default allocator we can use the free functions in alloc. [https://doc.rust-lang.org/alloc/alloc/index.html#functions]
+// This may be a better way to not use unstable Global struct and simply invoke our own simple struct type which implements Allocator using the
+// free functions in alloc?
+impl<T> InnerVec<T, Global> {
+	pub fn new(t: T) -> Self {
+		// TODO: Will use a new_in but for now just skip
+		// Also we are borrowing T here?
+		Self { inner: RawInnerVec::new_in(Global, align_of_val(&t)), _marker: PhantomData }
+	}
+}
 
 
 
@@ -221,6 +235,16 @@ mod tests {
 		use std::mem::size_of;
 		assert_eq!(size_of::<Option<CustomUsizeNoHighBit>>(), size_of::<CustomUsizeNoHighBit>(),
 		           "Option<CustomUsize> should be the same size (niche optimization active)");
+	}
+
+	#[test]
+	fn test_inner_vec_new() {
+
+		let size = 10;
+		let v = InnerVec::new(size);
+
+		assert!(v.inner.cap.get() == 0);
+
 	}
 
 }
