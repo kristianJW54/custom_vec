@@ -171,6 +171,13 @@ impl<A: Allocator> RawInnerVec<A> {
 
 	}
 
+
+	// Getters
+	#[inline]
+	const fn capacity(&self, elem_size: usize) -> usize {
+		if elem_size == 0 { usize::MAX } else { self.cap.0 }
+	}
+
 }
 
 //NOTE: std library uses two implement blocks for an InnerVec. The first being a Global allocator
@@ -187,6 +194,13 @@ impl<T> InnerVec<T, Global> {
 		// Also we are borrowing T here?
 		Self { inner: RawInnerVec::new_in(Global, align_of_val(&t)), _marker: PhantomData }
 	}
+
+
+
+	// Getters
+	const fn capacity(&self) -> usize {
+		self.inner.capacity(size_of::<T>())
+	}
 }
 
 
@@ -194,6 +208,14 @@ impl<T> InnerVec<T, Global> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_zst_capacity() {
+		let zst = ();
+		let mv = InnerVec::new(zst);
+		assert_eq!(mv.capacity(), 18446744073709551615);
+	}
+
 	#[test]
 	fn test_simple() {
 		println!("this is my vec");
@@ -208,13 +230,6 @@ mod tests {
 	fn test_valid_capacity() {
 		let c = unsafe { new_cap::<u8>(100) };
 		assert_eq!(c.get(), 100);
-	}
-
-	#[test]
-	fn test_zst_capacity() {
-		struct Zst;
-		let c = unsafe  { new_cap::<Zst>(100) };
-		assert_eq!(c.get(), 0);
 	}
 
 	#[test]
