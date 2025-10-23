@@ -7,7 +7,7 @@
 // Level 2: RawVec which holds a RawInner, a Cap for storing the capacity of a vec and a marker for the drop checker
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
-use std::alloc::{Allocator, Global, GlobalAlloc};
+use std::alloc::{GlobalAlloc, Layout};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
@@ -22,6 +22,26 @@ enum AllocInit {
 	Uninitialized,
 	Zeroed
 }
+
+// We also need define some Layout helpers. A Layout represents the shape of a block of memory
+// It's SIZE and ALIGNMENT
+// How many bytes in total do we need to allocate
+// and what is the alignment of each element.
+// Essentially:
+// We want to allocate memory for N elements of type T.
+// Each element has a known size and alignment.
+// Compute the total size (size * N) and keep the same alignment.
+// If multiplication overflows, fail gracefully.
+// Return that layout so we can tell the allocator how much to allocate.
+
+// std achieves this with a helper using some nightly methods
+// #[inline]
+// fn layout_array(cap: usize, elem_layout: Layout) -> Result<Layout, TryReserveError> {
+// 	elem_layout.repeat(cap).map(|(layout, _pad)| layout).map_err(|_| CapacityOverflow.into())
+// }
+
+//TODO: Implement layout helpers here...
+
 
 // For ZSTs there is zero allocation but a defined alignment
 // A vec of Vec<()>::new() could be size = 0 but alignment = 1
@@ -47,33 +67,30 @@ enum AllocInit {
 // This trick keeps `RawVec` compact and pointer-offset–safe without needing
 // an extra tag field for `Option<Cap>`.
 
+// See [https://doc.rust-lang.org/src/alloc/raw_vec/mod.rs.html#40]
+// Since we cannot replicate this in std without using internals, we must just take the
+// Extra memory for Option<> instead of 8 bytes it will be 16 bytes.
+
 // We define a global capacity overflow panic to call whenever we encounter this
 #[track_caller]
 fn capacity_overflow() -> ! {
 	panic!("capacity overflow");
 }
 
-// We use #![feature(rustc_attrs)] in lib.rs
-// We do this so we can replicate the internally defined UsizeNoHighBit niche optimised type which reserves
-// the top bit for the option tagging as mentioned above
-
-// See [https://doc.rust-lang.org/src/alloc/raw_vec/mod.rs.html#40]
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(0)]
-#[rustc_layout_scalar_valid_range_end(0x7FFF_FFFF_FFFF_FFFF)]
-struct CustomUsizeNoHighBit(usize);
+struct CustomUsize(usize);
 
-impl CustomUsizeNoHighBit {
+impl CustomUsize {
 
 	pub const MAX: usize = isize::MAX as usize;
 
 	// SAFETY: initializing type with `rustc_layout_scalar_valid_range` attr is unsafe
 
 	pub const unsafe fn new(value: usize) -> Option<Self> {
-		// SAFETY: We check the value here
-		if value <= 0x7FFF_FFFF_FFFF_FFFF {
+		// Safety: we checked upper bound.
+		if value <= 0x7FFF_FFFF_FFFF_FFFF{
 			Some(Self(value))
 		} else {
 			None
@@ -82,10 +99,10 @@ impl CustomUsizeNoHighBit {
 
 	/// Unsafe constructor.
 	///
-	/// # Safety
-	/// Caller must guarantee `val <= isize::MAX`.
-	pub const unsafe fn new_unchecked(val: usize) -> Self {
-		Self(val)
+	///# Safety
+	///Caller must guarantee `val <= isize::MAX`.
+	pub const unsafe fn new_unchecked(value: usize) -> Self {
+		Self(value)
 	}
 
 	pub const fn get(self) -> usize {
@@ -94,9 +111,9 @@ impl CustomUsizeNoHighBit {
 
 }
 
-type Cap = CustomUsizeNoHighBit;
+type Cap = CustomUsize;
 
-const ZERO_CAP: Cap = unsafe { CustomUsizeNoHighBit::new_unchecked(0) };
+const ZERO_CAP: Cap = unsafe { Cap::new_unchecked(0) };
 
 unsafe fn new_cap<T>(cap: usize) -> Cap {
 	if std::mem::size_of::<T>() == 0 {
@@ -118,37 +135,40 @@ unsafe fn new_cap<T>(cap: usize) -> Cap {
 /// The standard library uses this separation for operations which require only the layout
 ///
 /// We leave the type to the layer above in RawVec
+///
+/// At the moment, Allocator and Global is unstable so we can just use placeholder for now and continue
+/// with global allocator
 #[derive(Debug)]
-struct RawInnerVec<A: Allocator = Global> {
+struct RawInnerVec<A> {
 	// We have ownership of this raw byte buffer. It's untyped and safe for all T and can be
 	// cast later. Is always NonNull
 	ptr: NonNull<u8>, // The allocator allocated based on raw bytes and not on typed memory hence u8
 	cap: Cap, // Use custom Cap type to enforce 0..isize::MAX checks
-	alloc: A,
+	_alloc: PhantomData<A>,
 }
 
 // InnerVec will cast *mut u8 bytes to *mut T when using it
 
-// Level 2
+///# Level 2
 #[derive(Debug)]
-struct InnerVec<T, A: Allocator = Global> {
+struct InnerVec<T, A> {
 	inner: RawInnerVec<A>,
 	_marker: PhantomData<T>, // To signal to the drop checker that there is a type here to check
 }
 
 // Level 1
-struct MyVec<T, A: Allocator = Global> {
+struct MyVec<T, A> {
 	buf: InnerVec<T, A>,
 	len: usize,
 }
 
 // IMPL BLOCK for RawInnerVec
 
-impl<A: Allocator> RawInnerVec<A> {
+impl<A> RawInnerVec<A> {
 	#[inline]
 	// A constructor usually does not allocate, so here we want to initialize and empty buffer with cap = 0
 	// and a dangling pointer. We also need to store the alloc
-	const fn new_in(alloc: A, align: usize) -> Self {
+	const fn new_in(align: usize) -> Self {
 		// We need to define a NonNull pointer without provenance, meaning the pointer cannot be used
 		// for memory access as we have not yet allocated memory
 		// NonNull::dangling() provides an abstracted function for this but the alignment is always known when we
@@ -167,10 +187,13 @@ impl<A: Allocator> RawInnerVec<A> {
 		// use new_unchecked here
 		let nsu = unsafe { NonZeroUsize::new_unchecked(align) };
 		let ptr = NonNull::without_provenance(nsu);
-		Self { ptr, cap: ZERO_CAP, alloc }
+		// For alloc - we use PhantomData as placeholder for when Allocator internals become standard and we can
+		// pass in a custom allocation for memory
+		Self { ptr, cap: ZERO_CAP, _alloc: PhantomData }
 
 	}
 
+	const fn with_capacity(cap: usize, align: )
 
 	// Getters
 	#[inline]
@@ -188,11 +211,11 @@ impl<A: Allocator> RawInnerVec<A> {
 // For a default allocator we can use the free functions in alloc. [https://doc.rust-lang.org/alloc/alloc/index.html#functions]
 // This may be a better way to not use unstable Global struct and simply invoke our own simple struct type which implements Allocator using the
 // free functions in alloc?
-impl<T> InnerVec<T, Global> {
+impl<T, A> InnerVec<T, A> {
 	pub fn new(t: T) -> Self {
 		// TODO: Will use a new_in but for now just skip
 		// Also we are borrowing T here?
-		Self { inner: RawInnerVec::new_in(Global, align_of_val(&t)), _marker: PhantomData }
+		Self { inner: RawInnerVec::new_in(align_of_val(&t)), _marker: PhantomData }
 	}
 
 
@@ -212,8 +235,12 @@ mod tests {
 	#[test]
 	fn test_zst_capacity() {
 		let zst = ();
-		let mv = InnerVec::new(zst);
+		let mv: InnerVec<(), ()> = InnerVec::new(zst);
 		assert_eq!(mv.capacity(), 18446744073709551615);
+
+		let l: Layout = Layout::new::<i32>();
+
+
 	}
 
 	#[test]
@@ -248,15 +275,15 @@ mod tests {
 	#[test]
 	fn test_option_niche_size() {
 		use std::mem::size_of;
-		assert_eq!(size_of::<Option<CustomUsizeNoHighBit>>(), size_of::<CustomUsizeNoHighBit>(),
-		           "Option<CustomUsize> should be the same size (niche optimization active)");
+		assert_ne!(size_of::<Option<CustomUsize>>(), size_of::<CustomUsize>(),
+				   "Option<CustomUsize> should be the same size (niche optimization active)");
 	}
 
 	#[test]
 	fn test_inner_vec_new() {
 
 		let size = 10;
-		let v = InnerVec::new(size);
+		let v: InnerVec<i32, ()> = InnerVec::new(size);
 
 		assert!(v.inner.cap.get() == 0);
 
