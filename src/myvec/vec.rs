@@ -11,6 +11,8 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
+use std::collections::TryReserveError;
+use std::mem;
 use std::num::{NonZero, NonZeroUsize};
 
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
@@ -21,6 +23,12 @@ use std::num::{NonZero, NonZeroUsize};
 enum AllocInit {
 	Uninitialized,
 	Zeroed
+}
+
+// We define a global capacity overflow panic to call whenever we encounter this
+#[track_caller]
+fn capacity_overflow() -> ! {
+	panic!("capacity overflow");
 }
 
 // We also need define some Layout helpers. A Layout represents the shape of a block of memory
@@ -34,13 +42,43 @@ enum AllocInit {
 // If multiplication overflows, fail gracefully.
 // Return that layout so we can tell the allocator how much to allocate.
 
+// Example:
+// Size = 4 - Alignment = 4
+// 4 % 4 = 0 -> So we know we have good alignment
+// 4 * 0 = 0 -> First memory address index is 0..4
+// After 4 the next multiple is 8
+// We add in the 4 bytes and this fills the [4..8] block perfectly
+// After 8 the next multiple of 4 is 12
+// Again this fits - so our blocks are [0..4][0..8][8..12] no padding needed
+//
+// Size = 6 - Alignment = 4
+// 6 % 4 = 2 -> Not aligned meaning we need padding
+// 4 * 0 = 0 -> First address is fine but the size 0..6 means space occupied will end at 6
+// Next multiple after 6 is 8 [0..6] we need to pad 2 bytes [0..8] to align
+// We add in the 6 bytes to the next block which becomes [8..14]
+// The next multiple of 4 after 14 is 16 so we need to pad 2 bytes again [8..16]
+// Our Layout so far is [0..6]+2 pad[8..14]+2 pad..etc.
+
 // std achieves this with a helper using some nightly methods
 // #[inline]
 // fn layout_array(cap: usize, elem_layout: Layout) -> Result<Layout, TryReserveError> {
 // 	elem_layout.repeat(cap).map(|(layout, _pad)| layout).map_err(|_| CapacityOverflow.into())
 // }
 
-//TODO: Implement layout helpers here...
+fn layout_array_from_cap(cap: usize, elem_layout: Layout) -> Result<Layout, String> {
+
+	// First need to check alignment and see if any padding is needed
+	let pad = elem_layout.pad_to_align();
+	// Then we need to check if it's ok to repeat this layout for size n and that we don't overflow and are
+	// still aligned
+	let size = pad
+		.size()
+		.checked_mul(cap)
+		.ok_or_else(|| "capacity overflow")?;
+
+	// Build the final layout
+	Layout::from_size_align(size, pad.align()).map_err(|_| format!("invalid layout: size={} align={}", size, pad.align()))
+}
 
 
 // For ZSTs there is zero allocation but a defined alignment
@@ -70,12 +108,6 @@ enum AllocInit {
 // See [https://doc.rust-lang.org/src/alloc/raw_vec/mod.rs.html#40]
 // Since we cannot replicate this in std without using internals, we must just take the
 // Extra memory for Option<> instead of 8 bytes it will be 16 bytes.
-
-// We define a global capacity overflow panic to call whenever we encounter this
-#[track_caller]
-fn capacity_overflow() -> ! {
-	panic!("capacity overflow");
-}
 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -193,7 +225,15 @@ impl<A> RawInnerVec<A> {
 
 	}
 
-	const fn with_capacity(cap: usize, align: )
+	fn with_capacity(cap: usize, align: Layout) {
+
+		// TODO -> Need a try allocate in
+
+	}
+
+	//TODO Need to make a try_allocate_in which looks to allocate a block of memory based on layout or alloc init and cap
+	// If zst then we zero allocate
+	// Need to check if the ptr returned from a zero_alloc points to memory or how is it handled?
 
 	// Getters
 	#[inline]
@@ -233,13 +273,22 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn test_layout_alignment_helper() {
+
+		let cap = 10;
+		let layout = layout_array_from_cap(cap, Layout::new::<i32>()).unwrap();
+
+		let want = cap * 4;
+		assert_eq!(layout.size(), want);
+		assert_eq!(layout.align(), 4);
+
+	}
+
+	#[test]
 	fn test_zst_capacity() {
 		let zst = ();
 		let mv: InnerVec<(), ()> = InnerVec::new(zst);
 		assert_eq!(mv.capacity(), 18446744073709551615);
-
-		let l: Layout = Layout::new::<i32>();
-
 
 	}
 
