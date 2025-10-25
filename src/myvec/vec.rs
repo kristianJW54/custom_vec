@@ -11,9 +11,7 @@ use std::alloc::{alloc, alloc_zeroed, handle_alloc_error, Layout};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
-use std::collections::TryReserveError;
-use std::mem;
-use std::num::{NonZero, NonZeroUsize};
+use std::num::{NonZeroUsize};
 
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
 // help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
@@ -110,7 +108,7 @@ fn layout_array_from_cap(cap: usize, elem_layout: Layout) -> Result<Layout, Stri
 // Extra memory for Option<> instead of 8 bytes it will be 16 bytes.
 
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
 struct CustomUsize(usize);
 
@@ -182,13 +180,17 @@ struct RawInnerVec<A> {
 // InnerVec will cast *mut u8 bytes to *mut T when using it
 
 ///# Level 2
+///
+/// InnerVec is the Typed Memory Manager - it adds T(type) awareness, knows layouts and ensures alignment
 #[derive(Debug)]
 struct InnerVec<T, A> {
 	inner: RawInnerVec<A>,
 	_marker: PhantomData<T>, // To signal to the drop checker that there is a type here to check
 }
 
-// Level 1
+///# Level 1
+///
+/// MyVec is the top level vec which owns and tracks elements occupying the vec/block
 struct MyVec<T, A> {
 	buf: InnerVec<T, A>,
 	len: usize,
@@ -203,9 +205,7 @@ impl<A> RawInnerVec<A> {
 	const fn new_in(align: usize) -> Self {
 		// We need to define a NonNull pointer without provenance, meaning the pointer cannot be used
 		// for memory access as we have not yet allocated memory
-		// NonNull::dangling() provides an abstracted function for this but the alignment is always known when we
-		// have the T type.
-		// For this layer, we pass down the alignment from the type so we must align ourselves
+		// NonNull::dangling() provides an abstracted function for this, which creates a NonNull<u8>
 
 		// Std does this by using its internal Alignment implementation [https://doc.rust-lang.org/src/core/ptr/alignment.rs.html#13]
 		// Looking through the docs it seems that for a RawInnerVec only an usize is needed which is derived from
@@ -218,7 +218,7 @@ impl<A> RawInnerVec<A> {
 		//SAFETY: RawVec uses align_of_val which checks for correct alignment and non-zero so we are safe to
 		// use new_unchecked here
 		let nsu = unsafe { NonZeroUsize::new_unchecked(align) };
-		let ptr = NonNull::without_provenance(nsu);
+		let ptr = NonNull::dangling();
 		// For alloc - we use PhantomData as placeholder for when Allocator internals become standard and we can
 		// pass in a custom allocation for memory
 		Self { ptr, cap: ZERO_CAP, _alloc: PhantomData }
@@ -254,10 +254,10 @@ impl<A> RawInnerVec<A> {
 		};
 
 		// Final check is for alloc_init - if we are uninitialized we are free to allocate memory
-		// Otherwise if we are zeroed, then we should allocate zero // TODO Expand on this
+		// Otherwise if we are zeroed, then we use alloc_zeroed which allocates zero-initialized memory with the global allocator
 		let result: NonNull<u8> = match alloc_init {
 			AllocInit::Uninitialized => {
-				// We use the alloc free functions specified for std stable - note: when the allocator trait becomes stable
+				// We use the alloc free functions specified for std stable - to_note: when the allocator trait becomes stable
 				// we would use the A generic constraint on RawInnerVec to be generic over an allocator so we can use custom allocators
 				// passed in that satisfy the trait
 
@@ -300,20 +300,56 @@ impl<A> RawInnerVec<A> {
 
 // IMPL BLOCK for Default Global Allocator InnerVec
 // For a default allocator we can use the free functions in alloc. [https://doc.rust-lang.org/alloc/alloc/index.html#functions]
-// This may be a better way to not use unstable Global struct and simply invoke our own simple struct type which implements Allocator using the
-// free functions in alloc?
+// If we wanted to be generic over a future Allocator we could define a new impl block like std
+
+// Before we get to the impl - std defines a help function for small vecs which are dumb - meaning
+// as a minimum capacity of say 1 for certain types we should set a 'floor' for our capacity so as not to be wasteful
+// for example, a u8 type with capacity of 1 will only take up 1 byte of memory but this ends up getting rounded up to about 8 bytes
+// anyway and is cumbersome for meta-data. So it easier more efficient to just set a floor for minimum capacity
+
+const fn min_non_zero_capacity(size: usize) -> usize {
+	if size == 1 { // If we have an u8/i8 then we just round up to 8 bytes for minimum capacity
+		8
+	} else if size <= 1024 { // anything less than 1024 like u16 etc. should be 4 bytes
+		4
+	} else { // larger types should be exact
+		1
+	}
+}
+
 impl<T, A> InnerVec<T, A> {
+
+	// public to this crate only
+	pub(crate) const MIN_NON_ZERO_CAP: usize = min_non_zero_capacity(size_of::<T>());
+
+	#[inline]
 	pub fn new(t: T) -> Self {
-		// TODO: Will use a new_in but for now just skip
-		// Also we are borrowing T here?
 		Self { inner: RawInnerVec::new_in(align_of_val(&t)), _marker: PhantomData }
 	}
 
-
-
+	#[inline]
+	pub(crate) fn with_capacity(cap: usize) -> Self {
+		Self { inner: RawInnerVec::with_capacity(cap, Layout::new::<T>()), _marker: PhantomData }
+	}
 	// Getters
 	const fn capacity(&self) -> usize {
 		self.inner.capacity(size_of::<T>())
+	}
+}
+
+//--------------------------------------
+// Implementations for InnerVec
+
+impl<T, A> Drop for InnerVec<T, A> {
+	fn drop(&mut self) {
+		// Because this is the second layer - above us is Vec which tracks the elements occupying the vec
+		// Here we assume that vec has dropped those elements in place and leaves the deallocation of memory
+		// to the below layers
+		// As we are the memory manager we only need to call to inner to deallocate
+
+		//SAFETY: We are the only ones who call to de-allocate here and do not leak
+		// MyVec has already dropped elements at the addresses in the block so we are clear to remove the block
+		unsafe { /*self.inner.deallocate()*/ }
 	}
 }
 
