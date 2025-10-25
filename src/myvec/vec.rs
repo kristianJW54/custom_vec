@@ -7,7 +7,7 @@
 // Level 2: RawVec which holds a RawInner, a Cap for storing the capacity of a vec and a marker for the drop checker
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, handle_alloc_error, Layout};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
@@ -195,7 +195,7 @@ struct MyVec<T, A> {
 }
 
 // IMPL BLOCK for RawInnerVec
-
+// #[global_allocator]
 impl<A> RawInnerVec<A> {
 	#[inline]
 	// A constructor usually does not allocate, so here we want to initialize and empty buffer with cap = 0
@@ -208,14 +208,14 @@ impl<A> RawInnerVec<A> {
 		// For this layer, we pass down the alignment from the type so we must align ourselves
 
 		// Std does this by using its internal Alignment implementation [https://doc.rust-lang.org/src/core/ptr/alignment.rs.html#13]
-		// Looking through the docs it seems that for a RawInnerVec only a usize is needed which is derived from
+		// Looking through the docs it seems that for a RawInnerVec only an usize is needed which is derived from
 		// using Alignment -> Alignment::of::<T>() which gives a NonZero<usize> to pass to Layout
 
 		// align_of_val also gives this [https://doc.rust-lang.org/src/core/mem/mod.rs.html#509-512]
 		// So to avoid using an internal structure and to avoid implementing my own Alignment struct
-		// I will pass in a usize derived from align_of_val() which I can wrap in a NonZero
+		// I will pass in an usize derived from align_of_val() which I can wrap in a NonZero
 
-		// SAFETY: RawVec uses align_of_val which checks for correct alignment and non-zero so we are safe to
+		//SAFETY: RawVec uses align_of_val which checks for correct alignment and non-zero so we are safe to
 		// use new_unchecked here
 		let nsu = unsafe { NonZeroUsize::new_unchecked(align) };
 		let ptr = NonNull::without_provenance(nsu);
@@ -225,15 +225,66 @@ impl<A> RawInnerVec<A> {
 
 	}
 
-	fn with_capacity(cap: usize, align: Layout) {
+	fn with_capacity(cap: usize, elem_layout: Layout) -> Self {
 
 		// TODO -> Need a try allocate in
+		match Self::try_allocate(cap, AllocInit::Uninitialized, elem_layout) {
+			Ok(this) => { this }
+			Err(err) => { panic!("{}", err); }
+		}
 
 	}
 
 	//TODO Need to make a try_allocate_in which looks to allocate a block of memory based on layout or alloc init and cap
 	// If zst then we zero allocate
 	// Need to check if the ptr returned from a zero_alloc points to memory or how is it handled?
+
+	fn try_allocate(cap: usize, alloc_init: AllocInit, elem_layout: Layout) -> Result<Self, String> {
+		// First we need to build and validate the layout
+		let layout = match layout_array_from_cap(cap, elem_layout) {
+			Ok(layout) => layout,
+			Err(e) => return Err(e),
+		};
+
+		// If layout is 0 - we need to use new_in() method to make sure we don't allocate and instead return Self
+		// which is a pointer without_prevenance() and points to no actual memory. This is done in the std library because
+		// Drop is implemented and will not de-allocate on layouts/caps of 0 so if we allocate memory here we will not be able to release it
+		if layout.size() == 0 {
+			return Ok(Self::new_in(elem_layout.align()))
+		};
+
+		// Final check is for alloc_init - if we are uninitialized we are free to allocate memory
+		// Otherwise if we are zeroed, then we should allocate zero // TODO Expand on this
+		let result: NonNull<u8> = match alloc_init {
+			AllocInit::Uninitialized => {
+				// We use the alloc free functions specified for std stable - note: when the allocator trait becomes stable
+				// we would use the A generic constraint on RawInnerVec to be generic over an allocator so we can use custom allocators
+				// passed in that satisfy the trait
+
+				//SAFETY: We have checked and validated our layout, that it is not zero and is aligned - we should be
+				// safe to allocate from here - if not, we panic and handle alloc error
+				let a = unsafe { alloc(layout) };
+				if a.is_null() {
+					handle_alloc_error(layout);
+				};
+				// SAFETY: We have already checked that a is NonNull
+				unsafe { NonNull::new_unchecked(a) }
+			}
+			AllocInit::Zeroed => {
+
+				//SAFETY: AllocInit is Zeroed so we know we can call alloc_zeroed here based on the enum
+				let a = unsafe { alloc_zeroed(layout) };
+				if a.is_null() {
+					handle_alloc_error(layout);
+				}
+				// SAFETY: We have checked if NonNull
+				unsafe { NonNull::new_unchecked(a) }
+			},
+		};
+
+		Ok(Self { ptr: result, cap: unsafe { Cap::new_unchecked(cap) }, _alloc: PhantomData })
+
+	}
 
 	// Getters
 	#[inline]
@@ -336,6 +387,38 @@ mod tests {
 
 		assert!(v.inner.cap.get() == 0);
 
+	}
+
+	#[test]
+	fn test_raw_inner_vec_with_capacity_method() {
+		let cap_wanted: usize = 10;
+
+		// Normal (non-ZST) layout
+		let layout = Layout::new::<i32>();
+		let my_vec: RawInnerVec<()> = RawInnerVec::with_capacity(cap_wanted, layout);
+		assert_eq!(my_vec.cap.0, 10);
+
+		let addr = my_vec.ptr.as_ptr() as usize;
+		assert_eq!(addr % layout.align(), 0, "pointer is not aligned");
+
+		// ZST layout
+		let zst_layout = Layout::new::<()>();
+		let my_vec2: RawInnerVec<()> = RawInnerVec::with_capacity(cap_wanted, zst_layout);
+		assert_eq!(my_vec2.cap.0, 0);
+
+		// Expected bytes only for non-ZST
+		let expected_bytes = layout.size() * cap_wanted;
+		println!("Allocated {} bytes @ {:p}", expected_bytes, my_vec.ptr);
+
+		// Optional "poke test" - only for non-zero-sized
+		if expected_bytes > 0 {
+			unsafe {
+				std::ptr::write_bytes(my_vec.ptr.as_ptr(), 0xAB, expected_bytes);
+			}
+		}
+
+		let zst_addr = my_vec2.ptr.as_ptr() as usize;
+		assert!(zst_addr == 1 || zst_addr == usize::MAX, "ZST ptr should be dangling");
 	}
 
 }
