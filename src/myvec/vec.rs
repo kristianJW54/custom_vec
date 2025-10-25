@@ -7,7 +7,8 @@
 // Level 2: RawVec which holds a RawInner, a Cap for storing the capacity of a vec and a marker for the drop checker
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
-use std::alloc::{alloc, alloc_zeroed, handle_alloc_error, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::{alloc, cmp};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
@@ -292,6 +293,116 @@ impl<A> RawInnerVec<A> {
 		if elem_size == 0 { usize::MAX } else { self.cap.0 }
 	}
 
+	#[inline]
+	fn current_memory(&self, elem_layout: Layout) -> Option<(NonNull<u8>, Layout)> {
+
+		if elem_layout.size() == 0 || self.cap.0 == 0 {
+			None
+		} else {
+			// SAFETY: We have a valid layout with a capacity and pointer to allocated memory so we are safe to
+			// build and fetch
+			unsafe {
+				// We get the allocation size by getting the size of the layout and multiplying it by the
+				// capacity. Then we build the layout to return and fetch the pointer to the first
+				// address in the block
+				let alloc_size = elem_layout.size().unchecked_mul(self.cap.0);
+				let layout = Layout::from_size_align_unchecked(alloc_size, elem_layout.align());
+				Some((self.ptr.into(), layout))
+			}
+		}
+	}
+
+	// Memory methods
+
+	// This deallocates the owned allocation - from std [https://doc.rust-lang.org/src/alloc/raw_vec/mod.rs.html#749]
+	// This method is called by a Drop implementation
+
+	// SAFETY: We own the allocation and can safely deallocate, we do not update teh ptr or capacity to prevent double-free and
+	// use-after-free.
+	unsafe fn deallocate(&mut self, elem_layout: Layout) {
+		if let Some((ptr, layout)) = self.current_memory(elem_layout) {
+			unsafe { dealloc(ptr.as_ptr(), layout) }
+		}
+	}
+
+	// Grow Amortized
+	// We separate grow_one and grow_amortized because a simple push call will only call grow_one with additional = 1 when
+	// len == self.capacity()
+	// Other methods such as extend or append may need to reserve more space and therefore will need to grow
+	// to a larger block.
+	fn grow_amortized(&mut self, len: usize, additional: usize, elem_layout: Layout) -> Result<(), String> {
+
+		// Ensure that additional is larger than 0
+		assert!(additional > 0);
+
+		// Check that size is not 0 meaning we are not overfull
+		if elem_layout.size() == 0 {
+			return Err(String::from("capacity overflow"));
+		}
+
+		// We need to check if by adding the additional space we overflow or not
+		let required_cap = len.checked_add(additional).ok_or(String::from("capacity overflow"))?;
+
+		// We want to grow the cap so that it is either double or not less than what is immediately required
+		// So if the current cap is 0 and, we require 1
+		// Then if we tried to double - 0 * 2 = 0
+		// We would have less than what is required - so we look at what is the min_non_zero cap as well
+		// And take the max so that we have something that is not less than what is required and, we always grow exponentially
+
+		// Take our current cap and double it - we then take the max of that or required cap
+		let grow_cap = cmp::max(self.cap.0 * 2, required_cap);
+		// We then take the max of either the min_non_zero or the grow_cap
+		let grow_cap = cmp::max(min_non_zero_capacity(elem_layout.size()), grow_cap);
+
+		// We need to build a new layout for the grown block
+		let new_layout = layout_array_from_cap(grow_cap, elem_layout)?;
+
+		// Now we need to allocate the memory - std does this using a finish_grow() function
+		// [https://doc.rust-lang.org/src/alloc/raw_vec/mod.rs.html#766]
+		// We will just do it here
+
+		// We need to take the new layout and current memory and reallocate (if we can and have the contiguous space) or allocate new memory block
+		// We then take the returned ptr and new cap and store them
+
+		if let Some((ptr, old_layout)) = self.current_memory(elem_layout) {
+			// std rightfully checks that old and new alignment are the same here to make sure
+			// we are still allocating extra memory for the same aligned types
+			assert_eq!(old_layout.align(), new_layout.align());
+			unsafe {
+				let new_ptr = alloc::realloc(ptr.as_ptr(), old_layout, new_layout.size());
+				if new_ptr.is_null() {
+					alloc::handle_alloc_error(new_layout);
+				}
+
+				self.ptr = NonNull::new_unchecked(new_ptr);
+				self.cap = Cap::new_unchecked(grow_cap);
+			}
+			Ok(())
+
+		} else {
+
+			unsafe {
+				let new_ptr = alloc::alloc(new_layout);
+				if new_ptr.is_null() {
+					alloc::handle_alloc_error(new_layout);
+				};
+				self.ptr = NonNull::new_unchecked(new_ptr);
+				self.cap = Cap::new_unchecked(grow_cap);
+			}
+			Ok(())
+		}
+
+	}
+
+	// Additional will always be 1 so we just need the layout
+	// We also just panic for simplicity
+	fn grow_one(&mut self, elem_layout: Layout) {
+		match self.grow_amortized(elem_layout.size(), 1, elem_layout) {
+			Ok(()) => return,
+			Err(e) => { panic!("{}", e); }
+		}
+	}
+
 }
 
 //NOTE: std library uses two implement blocks for an InnerVec. The first being a Global allocator
@@ -335,6 +446,14 @@ impl<T, A> InnerVec<T, A> {
 	const fn capacity(&self) -> usize {
 		self.inner.capacity(size_of::<T>())
 	}
+
+	// Memory management
+
+	// grow should be called when len == self.capacity() and will only be used when calling methods
+	// such as push which are single element operations
+	pub(crate) fn grow_one(&mut self) {
+		self.inner.grow_one(Layout::new::<T>());
+	}
 }
 
 //--------------------------------------
@@ -349,7 +468,7 @@ impl<T, A> Drop for InnerVec<T, A> {
 
 		//SAFETY: We are the only ones who call to de-allocate here and do not leak
 		// MyVec has already dropped elements at the addresses in the block so we are clear to remove the block
-		unsafe { /*self.inner.deallocate()*/ }
+		unsafe { self.inner.deallocate(Layout::new::<T>()) }
 	}
 }
 
@@ -357,6 +476,7 @@ impl<T, A> Drop for InnerVec<T, A> {
 
 #[cfg(test)]
 mod tests {
+	use log::error;
 	use super::*;
 
 	#[test]
@@ -455,6 +575,32 @@ mod tests {
 
 		let zst_addr = my_vec2.ptr.as_ptr() as usize;
 		assert!(zst_addr == 1 || zst_addr == usize::MAX, "ZST ptr should be dangling");
+	}
+
+	#[test]
+	fn test_raw_inner_grow_amortized() {
+
+		let layout = Layout::new::<()>();
+
+		let mut vec: RawInnerVec<()> = RawInnerVec::with_capacity(4, layout);
+
+		println!("{:?}", vec.current_memory(layout));
+
+		vec.grow_amortized(2, 4, layout).expect_err("should panic");
+
+		println!("{:?}", vec.current_memory(layout));
+
+		let real_layout = Layout::new::<u8>();
+
+		let mut real_vec: RawInnerVec<()> = RawInnerVec::with_capacity(4, real_layout);
+
+		println!("Before: {:?}", real_vec.current_memory(real_layout));
+
+		real_vec.grow_amortized(2, 4, real_layout).unwrap();
+
+		println!("After: {:?}", real_vec.current_memory(real_layout));
+
+
 	}
 
 }
