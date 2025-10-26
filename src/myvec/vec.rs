@@ -8,12 +8,12 @@
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
-use std::{alloc, cmp};
+use std::{alloc, cmp, fmt, mem, slice};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
 use std::num::{NonZeroUsize};
-
+use std::ops::Deref;
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
 // help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
 // we have zeroed memory in which we need to allocate
@@ -293,6 +293,16 @@ impl<A> RawInnerVec<A> {
 		if elem_size == 0 { usize::MAX } else { self.cap.0 }
 	}
 
+	// Method to retrieve non_null ptr caste to the type
+	const fn non_null_ptr<T>(&self) -> NonNull<T> {
+		self.ptr.cast()
+	}
+
+	// Method to take a non_null ptr and return the *mut T ptr
+	const fn ptr<T>(&self) -> *mut T {
+		self.non_null_ptr().as_ptr()
+	}
+
 	#[inline]
 	fn current_memory(&self, elem_layout: Layout) -> Option<(NonNull<u8>, Layout)> {
 
@@ -434,8 +444,8 @@ impl<T, A> InnerVec<T, A> {
 	pub(crate) const MIN_NON_ZERO_CAP: usize = min_non_zero_capacity(size_of::<T>());
 
 	#[inline]
-	pub fn new(t: T) -> Self {
-		Self { inner: RawInnerVec::new_in(align_of_val(&t)), _marker: PhantomData }
+	pub fn new() -> Self {
+		Self { inner: RawInnerVec::new_in(mem::align_of::<T>()), _marker: PhantomData }
 	}
 
 	#[inline]
@@ -445,6 +455,10 @@ impl<T, A> InnerVec<T, A> {
 	// Getters
 	const fn capacity(&self) -> usize {
 		self.inner.capacity(size_of::<T>())
+	}
+
+	const fn ptr(&self) -> *mut T {
+		self.inner.ptr()
 	}
 
 	// Memory management
@@ -473,11 +487,95 @@ impl<T, A> Drop for InnerVec<T, A> {
 }
 
 
+//--------------------------------------------
+// Main Vec Impl Block
+//--------------------------------------------
+
+impl<T, A> MyVec<T, A> {
+
+	pub fn new() -> Self {
+		Self { buf: InnerVec::new(), len: 0 }
+	}
+
+	pub fn with_capacity(cap: usize) -> Self {
+		Self { buf: InnerVec::with_capacity(cap), len: 0 }
+	}
+
+	pub fn push(&mut self, elem: T) {
+
+		// First get the len
+		let len = self.len;
+
+		// We need to check if the vec needs to grow by comparing len == cap
+		if len == self.buf.capacity() {
+			// This grows the memory block and copies bytes over if new block had to be allocated
+			self.buf.grow_one();
+		}
+		// SAFETY: If we reach here and don't panic on capacity overflow then we have a safe block of
+		// memory with enough size to push another element (and more)
+		unsafe {
+			// Get a ptr to the start of the block
+			let ptr = self.buf.ptr();
+			// Add to the ptr the len so we can write to the end
+			ptr.add(len).write(elem);
+			// Then we update len to reflect new elem added
+			self.len = len + 1;
+
+			// std has a separate push_mut method which returns a ptr, but we omit this for now and
+			// just use push() method
+		}
+
+	}
+
+	pub fn as_ptr(&self) -> *const T {
+		self.buf.ptr()
+	}
+
+	pub fn as_slice(&self) -> &[T] {
+		// SAFETY: We own the ptr, track the len and manage the cap
+		// We know that the memory block is valid and has sufficient space
+		// We leverage the borrow checker by providing ownership and access through methods only
+		// with &self || &mut self
+		unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
+	}
+
+}
+
+//--------------------------------------------
+// Main Vec Implementations
+//--------------------------------------------
+
+// TODO -> Need to understand the slicing logic here and why this works this way
+impl<T, A> Deref for MyVec<T, A> {
+	type Target = [T];
+	fn deref(&self) -> &[T] {
+		self.as_slice()
+	}
+}
+
+impl<T: fmt::Debug, A> fmt::Debug for MyVec<T, A> {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		fmt::Debug::fmt(&**self, f)
+	}
+}
+
 
 #[cfg(test)]
 mod tests {
 	use log::error;
 	use super::*;
+
+	#[test]
+	fn test_start() {
+
+		let mut my_vec: MyVec<i32, ()> = MyVec::new();
+		my_vec.push(10);
+
+		println!("my_vec {:?}", my_vec);
+
+		println!("my_vec sliced at index 0 -> [{:?}]", my_vec[0]);
+
+	}
 
 	#[test]
 	fn test_layout_alignment_helper() {
@@ -493,8 +591,7 @@ mod tests {
 
 	#[test]
 	fn test_zst_capacity() {
-		let zst = ();
-		let mv: InnerVec<(), ()> = InnerVec::new(zst);
+		let mv: InnerVec<(), ()> = InnerVec::new();
 		assert_eq!(mv.capacity(), 18446744073709551615);
 
 	}
@@ -538,8 +635,7 @@ mod tests {
 	#[test]
 	fn test_inner_vec_new() {
 
-		let size = 10;
-		let v: InnerVec<i32, ()> = InnerVec::new(size);
+		let v: InnerVec<i32, ()> = InnerVec::new();
 
 		assert!(v.inner.cap.get() == 0);
 
