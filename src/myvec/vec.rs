@@ -7,13 +7,14 @@
 // Level 2: RawVec which holds a RawInner, a Cap for storing the capacity of a vec and a marker for the drop checker
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
-use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, GlobalAlloc, Layout};
 use std::{alloc, cmp, fmt, mem, slice};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
 use std::num::{NonZeroUsize};
 use std::ops::Deref;
+use std::vec::IntoIter;
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
 // help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
 // we have zeroed memory in which we need to allocate
@@ -545,7 +546,6 @@ impl<T, A> MyVec<T, A> {
 // Main Vec Implementations
 //--------------------------------------------
 
-// TODO -> Need to understand the slicing logic here and why this works this way
 impl<T, A> Deref for MyVec<T, A> {
 	type Target = [T];
 	fn deref(&self) -> &[T] {
@@ -558,6 +558,11 @@ impl<T: fmt::Debug, A> fmt::Debug for MyVec<T, A> {
 		fmt::Debug::fmt(&**self, f)
 	}
 }
+
+// To use Iterator - we need to implement IntoIterator and for that we need to specify a custom IntoIter struct
+// That we then implement Iterator for
+
+// TODO -> Implement IntoIterator
 
 
 #[cfg(test)]
