@@ -8,13 +8,14 @@
 // Level 3: RawInnerVec which handles the generic memory allocation and layout specificity
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, GlobalAlloc, Layout};
-use std::{alloc, cmp, fmt, mem, slice};
+use std::{alloc, cmp, fmt, mem, ptr, slice};
 use std::marker::PhantomData;
 use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
+use std::mem::ManuallyDrop;
 use std::num::{NonZeroUsize};
 use std::ops::Deref;
-use std::vec::IntoIter;
+use crate::myvec::into_iter::IntoIter;
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
 // help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
 // we have zeroed memory in which we need to allocate
@@ -462,6 +463,10 @@ impl<T, A> InnerVec<T, A> {
 		self.inner.ptr()
 	}
 
+	const fn non_null_ptr(&self) -> NonNull<T> {
+		self.inner.non_null_ptr()
+	}
+
 	// Memory management
 
 	// grow should be called when len == self.capacity() and will only be used when calling methods
@@ -476,6 +481,7 @@ impl<T, A> InnerVec<T, A> {
 
 impl<T, A> Drop for InnerVec<T, A> {
 	fn drop(&mut self) {
+		println!("RawInnerVec deallocating buffer {:?}", self.ptr());
 		// Because this is the second layer - above us is Vec which tracks the elements occupying the vec
 		// Here we assume that vec has dropped those elements in place and leaves the deallocation of memory
 		// to the below layers
@@ -529,7 +535,15 @@ impl<T, A> MyVec<T, A> {
 	}
 
 	pub fn as_ptr(&self) -> *const T {
+		self.buf.ptr() as *const T
+	}
+
+	pub fn as_mut_ptr(&mut self) -> *mut T {
 		self.buf.ptr()
+	}
+
+	pub fn non_null_ptr(&self) -> NonNull<T> {
+		self.buf.non_null_ptr()
 	}
 
 	pub fn as_slice(&self) -> &[T] {
@@ -559,15 +573,60 @@ impl<T: fmt::Debug, A> fmt::Debug for MyVec<T, A> {
 	}
 }
 
+impl<T, A> Drop for MyVec<T, A> {
+	fn drop(&mut self) {
+		println!("Dropping MyVec with len={} cap={}", self.len, self.buf.capacity());
+		unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.as_mut_ptr(), self.len)) }
+	}
+	// RawVec handles de-allocation
+}
+
 // To use Iterator - we need to implement IntoIterator and for that we need to specify a custom IntoIter struct
 // That we then implement Iterator for
 
 // TODO -> Implement IntoIterator
+impl<T, A> IntoIterator for MyVec<T, A> {
+	type Item = T;
+	type IntoIter = IntoIter<T, A>;
+	fn into_iter(self) -> Self::IntoIter {
+
+		let me = ManuallyDrop::new(self);
+
+		let buf = me.buf.non_null_ptr();
+		let ptr = me.buf.ptr();
+		let end = if mem::size_of::<T>() == 0 {
+			ptr.wrapping_byte_add(me.len)
+		} else {
+			unsafe { ptr.add(me.len) as *const T }
+		};
+
+		IntoIter { buf, ptr: buf, cap: me.buf.capacity(), _alloc: PhantomData, end }
+	}
+}
+
+// The reason why this works is that we implemented Deref coercion on MyVec meaning
+// any method available on &[T] becomes callable on &MyVec<T, A>
+// Step by step
+// 1. Self is of type &MyVec<T, A>
+// 2. The compiler checks if Self has a .iter() method - it doesn't but &MyVec automatically deref's
+//    Into &[T]
+// 3. The compiler checks that &MyVec implements Deref - it does
+// 4. Now Self has access to all of slices methods including .iter()
+
+// Deref wouldn't be called with MyVec because the Trait is defined for &T signature
+
+impl<'a, T, A> IntoIterator for &'a MyVec<T, A> {
+	type Item = &'a T;
+	type IntoIter = slice::Iter<'a, T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.iter()
+	}
+}
 
 
 #[cfg(test)]
 mod tests {
-	use log::error;
 	use super::*;
 
 	#[test]
@@ -701,6 +760,23 @@ mod tests {
 
 		println!("After: {:?}", real_vec.current_memory(real_layout));
 
+	}
+
+	#[test]
+	fn test_my_vec_iter() {
+
+		let mut my_vec: MyVec<i32, ()> = MyVec::new();
+		my_vec.push(10);
+		my_vec.push(20);
+		my_vec.push(30);
+
+		println!("{:?}", my_vec);
+
+		for i in &my_vec {
+			println!("{:?}", i);
+		}
+
+		std::mem::drop(my_vec);
 
 	}
 

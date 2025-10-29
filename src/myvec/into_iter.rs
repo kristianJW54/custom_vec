@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::{mem, slice};
 
 pub struct IntoIter<T, A> {
 
@@ -18,4 +19,47 @@ pub struct IntoIter<T, A> {
     pub(super) end: *const T,
 
 
+}
+
+impl<T, A> IntoIter<T, A> {
+
+    // Simple as_slice method for returning the rest of the MyVec as slice
+    fn as_slice(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.buf.as_ptr(), self.end.offset_from(self.buf.as_ptr()) as usize) }
+    }
+
+    // We could also have a mutable slice version
+
+}
+
+impl<T, A> Iterator for IntoIter<T, A> {
+    type Item = T;
+
+
+    fn next(&mut self) -> Option<T> {
+
+        let ptr = if mem::size_of::<T>() == 0 {
+
+            // If the current start ptr is the same as end we have no next and must return None
+            if self.ptr.as_ptr() == self.end as *mut T {
+                return None;
+            }
+            // we must leave the ptr as it because it is Ox1 dangling
+            // to adjust out len we, therefore, must reduce our end
+            self.end = self.end.wrapping_byte_sub(1);
+            self.ptr
+        } else {
+
+            if self.ptr.as_ptr() == self.end as *mut T {
+                //if self.ptr == non_null!(self.end, T) {
+                // unsafe { *((&raw const $place) as *const NonNull<$t>) }
+                return None;
+            }
+
+            let old_ptr = self.ptr;
+            self.ptr = unsafe { old_ptr.add(1) };
+            old_ptr
+        };
+        Some( unsafe { ptr.read() } )
+    }
 }
