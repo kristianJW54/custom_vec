@@ -14,7 +14,7 @@ use std::ptr::{NonNull};
 use std::cmp::{Eq, PartialEq, Ord, PartialOrd};
 use std::mem::ManuallyDrop;
 use std::num::{NonZeroUsize};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use crate::myvec::into_iter::IntoIter;
 // To try to follow with the std library implementation we will define a top level Alloc Enum which can
 // help with telling the Allocator if we have un-initialized memory (basically do nothing) or if
@@ -554,6 +554,10 @@ impl<T, A> MyVec<T, A> {
 		unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
 	}
 
+	pub fn as_mut_slice(&mut self) -> &mut [T] {
+		unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+	}
+
 }
 
 //--------------------------------------------
@@ -564,6 +568,12 @@ impl<T, A> Deref for MyVec<T, A> {
 	type Target = [T];
 	fn deref(&self) -> &[T] {
 		self.as_slice()
+	}
+}
+
+impl<T, A> DerefMut for MyVec<T, A> {
+	fn deref_mut(&mut self) -> &mut [T] {
+		self.as_mut_slice()
 	}
 }
 
@@ -777,6 +787,22 @@ mod tests {
 		}
 
 		std::mem::drop(my_vec);
+
+	}
+
+	#[test]
+	fn test_change_element() {
+
+		let mut my_vec: MyVec<i32, ()> = MyVec::new();
+		my_vec.push(10);
+		my_vec.push(20);
+		my_vec.push(30);
+
+		println!("{:?}", my_vec);
+
+		my_vec[2] = 40;
+
+		println!("{:?}", my_vec);
 
 	}
 
